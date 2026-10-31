@@ -199,6 +199,7 @@ function submit_(body) {
 function finalize_(sid, sess, answers, clientTimedOut) {
   const cache = CacheService.getScriptCache();
   const total = BANK.length;
+  const ts = new Date();
   const elapsed = Math.max(0, Math.round((Date.now() - sess.startedAt) / 1000));
   const timedOut = clientTimedOut || elapsed > TIME_LIMIT_SEC;
   const late = elapsed > TIME_LIMIT_SEC + GRACE_SEC;
@@ -234,7 +235,7 @@ function finalize_(sid, sess, answers, clientTimedOut) {
   const attempts = (prev ? prev.attempts : 0) + 1;
   const best = Math.max(prev ? prev.bestPct : 0, pct);
   const everPassed = (prev && prev.passed) || passedNow;
-  const firstPassed = (prev && prev.firstPassed) || (passedNow ? nowStr_() : '');
+  const firstPassed = (prev && prev.firstPassed) || (passedNow ? ts : '');
 
   const modeLabel = { full: 'Full test', retry: 'Retry missed questions', redo: 'Full test (re-attempt)' }[sess.mode];
   const note = [];
@@ -242,16 +243,18 @@ function finalize_(sid, sess, answers, clientTimedOut) {
   if (late) note.push('Submitted ' + (elapsed - TIME_LIMIT_SEC) + 's after the deadline');
 
   const sheets = ensureSheets_();
-  const row = [nowStr_(), sess.id, attempts, modeLabel, fmtDur_(elapsed), timedOut ? 'Yes' : 'No',
+  const row = [ts, sess.id, attempts, modeLabel, elapsed / 86400, timedOut ? 'Yes' : 'No',
                score + '/' + total, pct, passedNow ? 'PASS' : 'NOT YET', sess.qids.length, note.join('; ')];
   cells.forEach(function (c) { row.push(c[0], c[1]); });
   const rs = sheets.results;
   const r = rs.getLastRow() + 1;
   rs.getRange(r, 2, 1, 1).setNumberFormat('@');
   rs.getRange(r, 1, 1, row.length).setValues([row]);
+  rs.getRange(r, 1, 1, 1).setNumberFormat('yyyy-mm-dd hh:mm:ss');
+  rs.getRange(r, 5, 1, 1).setNumberFormat('[m]:ss');
 
   const srow = [sess.id, attempts, score + '/' + total, pct, best, everPassed ? 'Yes' : 'No', firstPassed,
-                stillWrong.map(function (q) { return q + 1; }).join(', '), nowStr_(), modeLabel];
+                stillWrong.map(function (q) { return q + 1; }).join(', '), ts, modeLabel];
   saveStudent_(sheets.students, prev ? prev.row : 0, srow);
 
   const result = {
@@ -295,7 +298,7 @@ function sessionPayload_(sid, sess, resumed) {
 }
 
 // ====================== SHEETS ======================
-const RESULT_FIXED = ['Timestamp', 'Student ID', 'Attempt No.', 'Mode', 'Time Taken (mm:ss)', 'Timed Out',
+const RESULT_FIXED = ['Timestamp', 'Student ID', 'Attempt No.', 'Mode', 'Time Taken (m:ss)', 'Timed Out',
                       'Score', 'Percentage (%)', 'Result (pass ≥ ' + PASS_PERCENT + '%)', 'Questions Presented', 'Notes'];
 const STUDENT_HEAD = ['Student ID', 'Attempts', 'Latest Score', 'Latest %', 'Best %', 'Passed (≥ ' + PASS_PERCENT + '%)',
                       'First Passed On', 'Outstanding Questions', 'Last Attempt', 'Last Mode'];
@@ -326,6 +329,7 @@ function ensureSheets_() {
     ss2.setFrozenRows(1);
     ss2.getRange(2, 1, 2000, 1).setNumberFormat('@');
   }
+  try { ensureDashboard_(ss); } catch (err) { Logger.log('Dashboard not built: ' + err); }
   return { results: rs, students: ss2 };
 }
 
@@ -351,6 +355,8 @@ function saveStudent_(sh, row, values) {
   const r = row || sh.getLastRow() + 1;
   sh.getRange(r, 1, 1, 1).setNumberFormat('@');
   sh.getRange(r, 1, 1, values.length).setValues([values]);
+  sh.getRange(r, 7, 1, 1).setNumberFormat('yyyy-mm-dd hh:mm:ss');
+  sh.getRange(r, 9, 1, 1).setNumberFormat('yyyy-mm-dd hh:mm:ss');
 }
 
 // ====================== HELPERS ======================
@@ -360,8 +366,6 @@ function normId_(v) {
   return id;
 }
 function opt_(item, i) { return 'ABCD'.charAt(i) + '. ' + item.o[i]; }
-function fmtDur_(s) { return Math.floor(s / 60) + ':' + ('0' + (s % 60)).slice(-2); }
-function nowStr_() { return Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd HH:mm:ss'); }
 function json_(o) { return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }
 function withLock_(fn) {
   const lock = LockService.getScriptLock();
@@ -372,5 +376,188 @@ function withLock_(fn) {
 /** Run once from the editor: authorises access to the sheet and creates the two tabs. */
 function setupSheets() {
   ensureSheets_();
-  Logger.log('Sheets ready: ' + RESULTS_SHEET + ', ' + STUDENTS_SHEET);
+  Logger.log('Sheets ready: ' + RESULTS_SHEET + ', ' + STUDENTS_SHEET + ', ' + DASH_SHEET);
+}
+
+/** Run from the editor to rebuild the Dashboard tab from scratch (e.g. after updating this script). */
+function setupDashboard() {
+  ensureSheets_();
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const old = ss.getSheetByName(DASH_SHEET);
+  if (old) ss.deleteSheet(old);
+  buildDashboard_(ss);
+  Logger.log('Dashboard rebuilt.');
+}
+
+
+// ====================== ADMIN DASHBOARD ======================
+// Built once; every number and chart is a live formula over the Students and Results tabs,
+// so it refreshes by itself each time a student submits.
+const DASH_SHEET = 'Dashboard';
+const MAXR = 5000;           // formulas look at rows 2..5000 of Results / Students
+const ROSTER_ROWS = 200;     // student rows shown in the roster
+
+function colLetter_(n) { let s = ''; while (n > 0) { const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = Math.floor((n - 1) / 26); } return s; }
+
+function ensureDashboard_(ss) {
+  if (!ss.getSheetByName(DASH_SHEET)) buildDashboard_(ss);
+}
+
+function buildDashboard_(ss) {
+  const sh = ss.insertSheet(DASH_SHEET);          // appended: always the final tab
+  ss.setSpreadsheetTimeZone(TZ);                   // so TODAY() / "per day" counts follow Singapore time
+  sh.setHiddenGridlines(true);
+  sh.setTabColor('#0e9f8a');
+
+  const S = function (c) { return STUDENTS_SHEET + '!$' + c + '$2:$' + c + '$' + MAXR; };
+  const R = function (c) { return RESULTS_SHEET + '!$' + c + '$2:$' + c + '$' + MAXR; };
+  const NAVY = '#0b3a6f', TEAL = '#0e9f8a', BLUE = '#14589f', AMBER = '#d98a00';
+  const N = BANK.length;
+
+  // ---- layout: A..L = dashboard, N.. = chart data
+  for (let c = 1; c <= 12; c++) sh.setColumnWidth(c, 95);
+  sh.setColumnWidth(11, 130); sh.setColumnWidth(12, 190);
+  sh.setColumnWidth(13, 40);
+  for (let c = 14; c <= 33; c++) sh.setColumnWidth(c, 105);
+  sh.setColumnWidth(30, 320);
+
+  // ---- title
+  sh.getRange(1, 1, 1, 12).merge().setValue('HUR SmartTouch Certification Assessment · Administrator Dashboard')
+    .setFontSize(20).setFontWeight('bold').setFontColor('#ffffff').setBackground(NAVY).setVerticalAlignment('middle').setHorizontalAlignment('left');
+  sh.setRowHeight(1, 52);
+  sh.getRange(2, 1, 1, 12).merge()
+    .setFormula('="Live view · updates automatically as students submit · Last submission: "&IF(COUNT(' + R('A') + ')=0,"none yet",TEXT(MAX(' + R('A') + '),"d mmm yyyy hh:mm"))')
+    .setFontColor('#5a6a80').setFontSize(10).setVerticalAlignment('middle');
+  sh.setRowHeight(2, 26);
+
+  // ---- KPI tiles (2 columns wide each)
+  function tile(row, col, label, formula, fmt) {
+    sh.getRange(row, col, 1, 2).merge().setValue(label).setFontSize(9).setFontWeight('bold').setFontColor('#5a6a80')
+      .setHorizontalAlignment('center').setVerticalAlignment('bottom').setBackground('#eef3fa');
+    sh.getRange(row + 1, col, 1, 2).merge().setFormula(formula).setNumberFormat(fmt).setFontSize(22).setFontWeight('bold')
+      .setFontColor(NAVY).setHorizontalAlignment('center').setVerticalAlignment('middle').setBackground('#eef3fa');
+  }
+  [3, 6, 9].forEach(function (r) { sh.setRowHeight(r, 10); });
+  sh.setRowHeight(4, 26); sh.setRowHeight(5, 46); sh.setRowHeight(7, 26); sh.setRowHeight(8, 46);
+  const nStu = 'COUNTA(' + S('A') + ')', nPass = 'COUNTIF(' + S('F') + ',"Yes")';
+  tile(4, 1,  'STUDENTS ATTEMPTED', '=' + nStu, '0');
+  tile(4, 3,  'TOTAL ATTEMPTS', '=COUNTA(' + R('B') + ')', '0');
+  tile(4, 5,  'PASSED (≥ ' + PASS_PERCENT + '%)', '=' + nPass, '0');
+  tile(4, 7,  'PASS RATE', '=IFERROR(' + nPass + '/' + nStu + ',0)', '0%');
+  tile(4, 9,  'NOT YET PASSED', '=' + nStu + '-' + nPass, '0');
+  tile(4, 11, 'AVERAGE BEST SCORE', '=IFERROR(AVERAGE(' + S('E') + '),0)', '0.0"%"');
+  tile(7, 1,  'SCORED 100%', '=COUNTIF(' + S('E') + ',100)', '0');
+  tile(7, 3,  'AVG ATTEMPTS / STUDENT', '=IFERROR(AVERAGE(' + S('B') + '),0)', '0.0');
+  tile(7, 5,  'AVG TIME TAKEN', '=IFERROR(AVERAGE(' + R('E') + '),0)', '[m]:ss');
+  tile(7, 7,  'TIMED-OUT ATTEMPTS', '=COUNTIF(' + R('F') + ',"Yes")', '0');
+  tile(7, 9,  'SUBMISSIONS TODAY', '=COUNTIFS(' + R('A') + ',">="&TODAY(),' + R('A') + ',"<"&(TODAY()+1))', '0');
+  tile(7, 11, 'MOST-MISSED QUESTION', '=IF(MAX(AF4:AF' + (3 + N) + ')=0,"—",INDEX(AC4:AC' + (3 + N) + ',MATCH(MAX(AF4:AF' + (3 + N) + '),AF4:AF' + (3 + N) + ',0)))', '@');
+
+  // ---- chart data (columns N onward)
+  sh.getRange(1, 14, 1, 1).setValue('CHART DATA · calculated automatically, please do not edit').setFontWeight('bold').setFontColor('#5a6a80');
+  function head(row, col, labels) { sh.getRange(row, col, 1, labels.length).setValues([labels]).setFontWeight('bold').setBackground('#eef3fa').setFontColor(NAVY); }
+  function labelsAndFormulas(row, col, rows) {          // rows: [label, formula]
+    rows.forEach(function (r, i) { sh.getRange(row + i, col).setValue(r[0]); sh.getRange(row + i, col + 1).setFormula(r[1]); });
+  }
+
+  // pass status (N:O)
+  head(3, 14, ['Pass status', 'Students']);
+  labelsAndFormulas(4, 14, [['Passed', '=' + nPass], ['Not yet passed', '=' + nStu + '-' + nPass]]);
+
+  // best-score bands (Q:R)
+  head(3, 17, ['Best score band', 'Students']);
+  const bands = [['Below 50%', 0, 50], ['50–59%', 50, 60], ['60–69%', 60, 70], ['70–79%', 70, 80], ['80–89%', 80, 90], ['90–99%', 90, 100]];
+  const bandRows = bands.map(function (b) { return [b[0], '=COUNTIFS(' + S('E') + ',">="&' + b[1] + ',' + S('E') + ',"<"&' + b[2] + ')']; });
+  bandRows.push(['100%', '=COUNTIF(' + S('E') + ',100)']);
+  labelsAndFormulas(4, 17, bandRows);
+
+  // attempts per student (T:U)
+  head(3, 20, ['Attempts', 'Students']);
+  labelsAndFormulas(4, 20, [
+    ['1 attempt', '=COUNTIF(' + S('B') + ',1)'], ['2 attempts', '=COUNTIF(' + S('B') + ',2)'],
+    ['3 attempts', '=COUNTIF(' + S('B') + ',3)'], ['4+ attempts', '=COUNTIF(' + S('B') + ',">=4")']]);
+
+  // submissions per day, last 14 days (W:X)
+  head(3, 23, ['Day', 'Submissions']);
+  const dayRows = [];
+  for (let n = 0; n < 14; n++) {
+    const d0 = 'TODAY()-' + (13 - n), d1 = 'TODAY()-' + (12 - n);
+    dayRows.push(['=TEXT(' + d0 + ',"d mmm")', '=COUNTIFS(' + R('A') + ',">="&(' + d0 + '),' + R('A') + ',"<"&(' + d1 + '))']);
+  }
+  dayRows.forEach(function (r, i) { sh.getRange(4 + i, 23).setFormula(r[0]); sh.getRange(4 + i, 24).setFormula(r[1]); });
+
+  // attempt type (Z:AA)
+  head(3, 26, ['Attempt type', 'Attempts']);
+  labelsAndFormulas(4, 26, [
+    ['Full test', '=COUNTIF(' + R('D') + ',"Full test")'],
+    ['Retry missed questions', '=COUNTIF(' + R('D') + ',"Retry missed questions")'],
+    ['Full test (re-attempt)', '=COUNTIF(' + R('D') + ',"Full test (re-attempt)")']]);
+
+  // question analysis (AC:AG)
+  head(3, 29, ['Question', 'Question text', 'Times presented', 'Times wrong', '% correct']);
+  BANK.forEach(function (item, k) {
+    const row = 4 + k, rng = R(colLetter_(11 + 2 * (k + 1)));
+    sh.getRange(row, 29).setValue('Q' + (k + 1));
+    sh.getRange(row, 30).setValue(item.q);
+    sh.getRange(row, 31).setFormula('=COUNTIF(' + rng + ',"Correct")+COUNTIF(' + rng + ',"Wrong")+COUNTIF(' + rng + ',"Not answered")');
+    sh.getRange(row, 32).setFormula('=COUNTIF(' + rng + ',"Wrong")+COUNTIF(' + rng + ',"Not answered")');
+    sh.getRange(row, 33).setFormula('=IFERROR((AE' + row + '-AF' + row + ')/AE' + row + ',0)');
+  });
+  sh.getRange(4, 33, N, 1).setNumberFormat('0%');
+  sh.getRange(3, 14, 1, 20).setFontSize(10);
+  sh.getRange(4, 14, 40, 20).setFontColor('#5a6a80').setFontSize(10);
+
+  // ---- charts
+  function chart(type, a1s, title, row, col, w, h, colors, extra) {
+    let b = sh.newChart().setChartType(type);
+    a1s.forEach(function (a) { b = b.addRange(sh.getRange(a)); });
+    b = b.setNumHeaders(1).setPosition(row, col, 0, 0)
+      .setOption('title', title).setOption('width', w).setOption('height', h)
+      .setOption('colors', colors).setOption('titleTextStyle', { fontSize: 13, bold: true, color: NAVY });
+    Object.keys(extra || {}).forEach(function (k) { b = b.setOption(k, extra[k]); });
+    sh.insertChart(b.build());
+  }
+  const noLegend = { legend: { position: 'none' } };
+  chart(Charts.ChartType.PIE, ['N3:O5'], 'Pass status (students)', 12, 1, 370, 300, [TEAL, AMBER], { pieHole: 0.5, legend: { position: 'bottom' } });
+  chart(Charts.ChartType.COLUMN, ['Q3:R10'], 'Best score distribution (students)', 12, 5, 370, 300, [BLUE], noLegend);
+  chart(Charts.ChartType.COLUMN, ['T3:U7'], 'Attempts per student', 12, 9, 370, 300, [NAVY], noLegend);
+  chart(Charts.ChartType.COLUMN, ['W3:X17'], 'Submissions per day (last 14 days)', 28, 1, 560, 300, [TEAL], noLegend);
+  chart(Charts.ChartType.PIE, ['Z3:AA6'], 'Attempt type', 28, 7, 560, 300, [BLUE, TEAL, AMBER], { pieHole: 0.5, legend: { position: 'bottom' } });
+  chart(Charts.ChartType.COLUMN, ['AC3:AC' + (3 + N), 'AG3:AG' + (3 + N)], '% correct by question (all attempts) · lower = harder', 44, 1, 1130, 320, [BLUE],
+        Object.assign({ vAxis: { minValue: 0, maxValue: 1, format: '0%' } }, noLegend));
+
+  // ---- most-missed questions
+  sh.getRange(61, 1, 1, 12).merge().setValue('Top 5 most-missed questions').setFontWeight('bold').setFontSize(13).setFontColor(NAVY);
+  sh.getRange(62, 1, 1, 3).setValues([['Question', 'Times wrong', 'Question text']]).setFontWeight('bold').setBackground('#eef3fa').setFontColor(NAVY);
+  sh.getRange(62, 4, 1, 9).setBackground('#eef3fa');
+  sh.getRange(63, 1).setFormula('=IFERROR(ARRAY_CONSTRAIN(SORT({AC4:AC' + (3 + N) + ',AF4:AF' + (3 + N) + ',AD4:AD' + (3 + N) + '},2,FALSE),5,3),"")');
+
+  // ---- student roster
+  sh.getRange(70, 1, 1, 12).merge().setValue('Student roster · who has attempted, and how they are doing').setFontWeight('bold').setFontSize(13).setFontColor(NAVY);
+  sh.getRange(71, 1, 1, 12).setValues([['Student ID', 'Attempts', 'Latest %', 'Best %', 'Best (bar)', 'Status', 'Questions still to fix', '', '', '', 'Last attempt', 'Last mode']])
+    .setFontWeight('bold').setBackground('#eef3fa').setFontColor(NAVY);
+  const roster = [];
+  for (let i = 0; i < ROSTER_ROWS; i++) {
+    const s = i + 2, A = STUDENTS_SHEET + '!$A$' + s, g = function (c) { return '=IF(' + A + '="","",' + STUDENTS_SHEET + '!$' + c + '$' + s + ')'; };
+    roster.push([
+      g('A'), g('B'), g('D'), g('E'),
+      '=IF(' + A + '="","",SPARKLINE(' + STUDENTS_SHEET + '!$E$' + s + ',{"charttype","bar";"max",100;"color1","' + TEAL + '"}))',
+      '=IF(' + A + '="","",IF(' + STUDENTS_SHEET + '!$F$' + s + '="Yes","Passed","Not yet"))',
+      '=IF(' + A + '="","",IF(' + STUDENTS_SHEET + '!$H$' + s + '="","—",' + STUDENTS_SHEET + '!$H$' + s + '))',
+      '', '', '', g('I'), g('J')
+    ]);
+  }
+  sh.getRange(72, 1, ROSTER_ROWS, 12).setFormulas(roster);
+  sh.getRange(72, 3, ROSTER_ROWS, 2).setNumberFormat('0.0"%"');
+  sh.getRange(72, 11, ROSTER_ROWS, 1).setNumberFormat('d mmm yyyy hh:mm');
+  sh.getRange(72, 1, ROSTER_ROWS, 12).setVerticalAlignment('middle');
+
+  const rosterStatus = sh.getRange(72, 6, ROSTER_ROWS, 1);
+  sh.setConditionalFormatRules([
+    SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('Passed').setBackground('#d1e7dd').setFontColor('#0f5132').setRanges([rosterStatus]).build(),
+    SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('Not yet').setBackground('#fff3cd').setFontColor('#664d03').setRanges([rosterStatus]).build()
+  ]);
+
+  try { ss.setActiveSheet(sh); ss.moveActiveSheet(ss.getNumSheets()); } catch (e) { /* already last */ }
+  return sh;
 }
