@@ -329,7 +329,7 @@ function ensureSheets_() {
     ss2.setFrozenRows(1);
     ss2.getRange(2, 1, 2000, 1).setNumberFormat('@');
   }
-  try { ensureDashboard_(ss); } catch (err) { Logger.log('Dashboard not built: ' + err); }
+  try { ensureDashboard_(ss); } catch (err) { console.error('Dashboard not built: ' + (err && err.stack || err)); }
   return { results: rs, students: ss2 };
 }
 
@@ -376,17 +376,19 @@ function withLock_(fn) {
 /** Run once from the editor: authorises access to the sheet and creates the two tabs. */
 function setupSheets() {
   ensureSheets_();
+  if (!SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(DASH_SHEET)) { CacheService.getScriptCache().remove('dash_err'); buildDashboard_(SpreadsheetApp.openById(SPREADSHEET_ID)); }
   Logger.log('Sheets ready: ' + RESULTS_SHEET + ', ' + STUDENTS_SHEET + ', ' + DASH_SHEET);
 }
 
 /** Run from the editor to rebuild the Dashboard tab from scratch (e.g. after updating this script). */
 function setupDashboard() {
-  ensureSheets_();
+  CacheService.getScriptCache().remove('dash_err');
   const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  ensureSheets_();                                   // Results + Students (never builds the dashboard twice)
   const old = ss.getSheetByName(DASH_SHEET);
   if (old) ss.deleteSheet(old);
-  buildDashboard_(ss);
-  Logger.log('Dashboard rebuilt.');
+  buildDashboard_(ss);                               // errors are NOT swallowed here: they show in the log
+  Logger.log('Dashboard rebuilt: see the "' + DASH_SHEET + '" tab.');
 }
 
 
@@ -400,11 +402,26 @@ const ROSTER_ROWS = 200;     // student rows shown in the roster
 function colLetter_(n) { let s = ''; while (n > 0) { const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = Math.floor((n - 1) / 26); } return s; }
 
 function ensureDashboard_(ss) {
-  if (!ss.getSheetByName(DASH_SHEET)) buildDashboard_(ss);
+  if (ss.getSheetByName(DASH_SHEET)) return;
+  const cache = CacheService.getScriptCache();
+  if (cache.get('dash_err')) return;                 // do not retry on every request after a failure
+  try { buildDashboard_(ss); } catch (err) { cache.put('dash_err', '1', 300); throw err; }
 }
 
 function buildDashboard_(ss) {
   const sh = ss.insertSheet(DASH_SHEET);          // appended: always the final tab
+  try {
+    // a brand-new tab is only 26 columns wide; the dashboard needs ~33 (chart data lives in N:AG)
+    if (sh.getMaxColumns() < 40) sh.insertColumnsAfter(sh.getMaxColumns(), 40 - sh.getMaxColumns());
+    if (sh.getMaxRows() < 300) sh.insertRowsAfter(sh.getMaxRows(), 300 - sh.getMaxRows());
+    return buildDashboardBody_(ss, sh);
+  } catch (err) {
+    try { ss.deleteSheet(sh); } catch (e2) { /* ignore */ }   // never leave a half-built blank tab behind
+    throw err;
+  }
+}
+
+function buildDashboardBody_(ss, sh) {
   ss.setSpreadsheetTimeZone(TZ);                   // so TODAY() / "per day" counts follow Singapore time
   sh.setHiddenGridlines(true);
   sh.setTabColor('#0e9f8a');
@@ -451,7 +468,7 @@ function buildDashboard_(ss) {
   tile(7, 5,  'AVG TIME TAKEN', '=IFERROR(AVERAGE(' + R('E') + '),0)', '[m]:ss');
   tile(7, 7,  'TIMED-OUT ATTEMPTS', '=COUNTIF(' + R('F') + ',"Yes")', '0');
   tile(7, 9,  'SUBMISSIONS TODAY', '=COUNTIFS(' + R('A') + ',">="&TODAY(),' + R('A') + ',"<"&(TODAY()+1))', '0');
-  tile(7, 11, 'MOST-MISSED QUESTION', '=IF(MAX(AF4:AF' + (3 + N) + ')=0,"—",INDEX(AC4:AC' + (3 + N) + ',MATCH(MAX(AF4:AF' + (3 + N) + '),AF4:AF' + (3 + N) + ',0)))', '@');
+  tile(7, 11, 'MOST-MISSED QUESTION', '=IF(MAX(AF4:AF' + (3 + N) + ')=0,"—",INDEX(AC4:AC' + (3 + N) + ',MATCH(MAX(AF4:AF' + (3 + N) + '),AF4:AF' + (3 + N) + ',0)))', '0');
 
   // ---- chart data (columns N onward)
   sh.getRange(1, 14, 1, 1).setValue('CHART DATA · calculated automatically, please do not edit').setFontWeight('bold').setFontColor('#5a6a80');
